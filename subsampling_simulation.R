@@ -1,244 +1,503 @@
 ###############################################################################
-# SUBSAMPLING-BASED SIMULATION FOR A MULTIVARIATE RANK/SIGN DEPENDENCE STATISTIC
+# MULTIVARIATE FOURTH-ORDER SIGN-CONCORDANCE STATISTIC
+# Revised implementation based on Sections 3, 4 and 5 of the manuscript
 #
-# Purpose:
-#   1. Generate independent, linear, quadratic, and sinusoidal dependence data.
-#   2. Compute the manuscript's custom multivariate fourth-order sign statistic.
-#   3. Approximate the statistic by Monte Carlo sampling of quadruples, avoiding
-#      the O(n^4) cost of enumerating every quadruple.
-#   4. Construct subsampling distributions and root-n subsampling confidence
-#      intervals.
-#   5. Summarize empirical size/power, coverage, interval width, and quantiles.
-#   6. Save CSV results and PNG plots.
+# Main features:
+#  1. Uses the concordance comparison sign{(x1-x3)(x2-x4)} in Section 3.1.
+#  2. Symmetrizes the fourth-order kernel over its three distinct pairings.
+#  3. Computes the fourth-order U-statistic by exact enumeration when feasible,
+#     and Monte Carlo quadruple sampling otherwise.
+#  4. Implements the centred, sqrt(b_n)-scaled subsampling distribution
+#     described in Section 5.1.
+#  5. Constructs the manuscript's two-sided confidence interval.
+#  6. Implements the upper-tail subsampling test described in Section 5.1.
+#  7. Reports interval-based rejection separately from the upper-tail test.
+#  8. Estimates scenario-specific reference values by independent simulation.
 #
-# IMPORTANT METHODOLOGICAL NOTES:
-#   * The kernel below reproduces the custom sign-product construction in the
-#     manuscript's Parkinson/R-code section. It should NOT be called the
-#     canonical Bergsma-Dassios tau* statistic until its kernel has been
-#     mathematically verified against the definition/theorems in the paper.
-#   * Random quadruple sampling approximates the all-quadruple average. It is
-#     much faster, but adds Monte Carlo approximation error. Increase N_QUADS
-#     and repeat with different seeds for a stability check.
-#   * The confidence interval below uses sqrt(n) scaling, as in the manuscript's
-#     subsampling section. Its validity depends on a suitable root-n limit.
-#     Degenerate fourth-order U-statistics under independence may not have this
-#     limit; check the theorem and kernel degeneracy before interpreting the
-#     intervals as formally valid.
-#   * Coverage for alternatives is computed against a large-sample Monte Carlo
-#     reference for the same custom kernel. This is a numerical reference, not
-#     an analytic population value. Under the null, the reference is set to 0.
+# THEORETICAL CAUTION:
+# The manuscript's root-n Gaussian limit and second-order degeneracy assertion
+# require a separate mathematical verification. The sqrt(n) normalization
+# below reproduces the proposed procedure; it does not prove its validity.
 ###############################################################################
 
-## ----------------------------- USER SETTINGS -------------------------------
+set.seed(20261121)
 
-set.seed(20261017)
+## 1. USER SETTINGS -----------------------------------------------------------
 
-OUTPUT_DIR <- "subsampling_simulation_results"
-if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+OUTPUT_DIR <- "revised_multivariate_taustar_results"
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
 
-# Quick test settings. Increase for a final study.
-N_VALUES       <- c(60, 100, 150)
+N_VALUES        <- c(60, 100, 150)
 P               <- 3
-R_MC            <- 100       # Monte Carlo data-generation replications
-M_SUBSAMPLES    <- 100       # subsamples per generated dataset
-N_QUADS         <- 10000     # sampled quadruples per statistic evaluation
-N_QUADS_REF     <- 200000    # sampled quadruples for reference parameter
-N_REF           <- 4000      # independent reference sample size
+Q               <- 1
+
+R_MC            <- 100
+M_SUBSAMPLES    <- 300
+
+N_QUADS_FULL    <- 100000
+N_QUADS_REF     <- 200000
+N_REF           <- 4000
+
 ALPHA           <- 0.05
-SUBSAMPLE_POWER <- 0.70      # b_n = floor(n^gamma)
+SUBSAMPLE_POWER <- 0.70
+
 NOISE_SD        <- 0.70
 LINEAR_RHO      <- 0.60
 SINE_FREQUENCY  <- 1.50
 
-# Use "quick" first. For final results, consider R_MC >= 500, M_SUBSAMPLES
-# >= 500, and a sensitivity analysis over N_QUADS and SUBSAMPLE_POWER.
+# Exact enumeration is used whenever choose(n,4) does not exceed this limit.
+EXACT_LIMIT     <- 2000000
+
 SCENARIOS <- c("independence", "linear", "quadratic", "sine")
 
-## --------------------------- DATA GENERATION -------------------------------
 
-generate_data <- function(n, p = 3, scenario,
-                          noise_sd = 0.70, rho = 0.60,
+## 2. DATA GENERATION ---------------------------------------------------------
+
+generate_data <- function(n, p = 3, q = 1,
+                          scenario = c("independence", "linear",
+                                       "quadratic", "sine"),
+                          noise_sd = 0.70,
+                          rho = 0.60,
                           sine_frequency = 1.50) {
-  stopifnot(n >= 4, p >= 1)
+
+  scenario <- match.arg(scenario)
 
   X <- matrix(rnorm(n * p), nrow = n, ncol = p)
   colnames(X) <- paste0("X", seq_len(p))
+
+  Y <- matrix(rnorm(n * q), nrow = n, ncol = q)
+  colnames(Y) <- paste0("Y", seq_len(q))
+
   eps <- rnorm(n)
 
   if (scenario == "independence") {
+
     # X and Y are generated independently.
-    Y <- rnorm(n)
+
   } else if (scenario == "linear") {
-    # Unit-variance linear signal when X1 and eps are standard normal.
-    Y <- rho * X[, 1] + sqrt(1 - rho^2) * eps
+
+    Y[, 1] <- rho * X[, 1] +
+      sqrt(1 - rho^2) * eps
+
   } else if (scenario == "quadratic") {
-    # Nonlinear dependence with zero population Pearson correlation
-    # between X1 and X1^2 + independent noise under symmetric X1.
-    Y <- X[, 1]^2 + noise_sd * eps
+
+    Y[, 1] <- X[, 1]^2 + noise_sd * eps
+
   } else if (scenario == "sine") {
-    # Oscillatory, non-monotone dependence.
-    Y <- sin(sine_frequency * X[, 1]) + noise_sd * eps
-  } else {
-    stop("Unknown scenario: ", scenario)
+
+    Y[, 1] <- sin(sine_frequency * X[, 1]) +
+      noise_sd * eps
   }
 
-  list(X = X, Y = as.numeric(Y))
+  list(X = X, Y = Y)
 }
 
-## ----------------------- CUSTOM SIGN-BASED STATISTIC -----------------------
 
-# For a vector-valued row pair, this is the product of componentwise signs.
-# This function is used in the custom kernel reproduced from the manuscript.
-sign_product_rows <- function(X, a, b) {
-  if (ncol(X) == 1L) return(sign(X[a, 1] - X[b, 1]))
-  row_prod <- rep(1, length(a))
-  for (j in seq_len(ncol(X))) {
-    row_prod <- row_prod * sign(X[cbind(a, j)] - X[cbind(b, j)])
-  }
-  row_prod
-}
+## 3. MULTIVARIATE CONCORDANCE COMPONENT -------------------------------------
 
-# Monte Carlo approximation to the manuscript's custom fourth-order statistic.
-# Each sampled quadruple consists of four distinct row indices. Their order
-# follows increasing row index, matching the manuscript's combn(n, 4) pattern.
+# For a particular pairing (r,s) and (t,u), calculate
 #
-# The exact version would average this kernel over choose(n, 4) quadruples.
-# Sampling N_QUADS quadruples is an approximation to that average.
-tau_star_mv_mc <- function(X, Y, n_quads = 10000) {
+#   product_j sign{(X_rj - X_sj)(X_tj - X_uj)}.
+#
+# This is the coordinatewise extension of the comparison in Section 3.1.
+
+concordance_component <- function(A, i1, i2, i3, i4) {
+
+  A <- as.matrix(A)
+
+  ans <- rep(1, length(i1))
+
+  for (j in seq_len(ncol(A))) {
+
+    ans <- ans *
+      sign((A[i1, j] - A[i2, j]) *
+           (A[i3, j] - A[i4, j]))
+  }
+
+  ans
+}
+
+
+## 4. SYMMETRIC FOURTH-ORDER KERNEL ------------------------------------------
+
+# The displayed comparison in Section 3.1 uses one pairing:
+# (1,3) with (2,4).
+#
+# A fourth-order U-statistic requires a symmetric kernel. The code therefore
+# uses the average over the three distinct pairings of four observations.
+#
+# This is the symmetric version of the product construction. It should be
+# checked against the precise intended population definition before being
+# identified with the canonical Bergsma-Dassios tau-star kernel.
+
+kernel_tau4 <- function(X, Y, ind) {
+
   X <- as.matrix(X)
-  Y <- as.numeric(Y)
+  Y <- as.matrix(Y)
+  ind <- as.matrix(ind)
+
+  i <- ind[, 1]
+  j <- ind[, 2]
+  k <- ind[, 3]
+  l <- ind[, 4]
+
+  # Pairing 1: (1,2) with (3,4)
+  ax1 <- concordance_component(X, i, j, k, l)
+  ay1 <- concordance_component(Y, i, j, k, l)
+
+  # Pairing 2: (1,3) with (2,4)
+  ax2 <- concordance_component(X, i, k, j, l)
+  ay2 <- concordance_component(Y, i, k, j, l)
+
+  # Pairing 3: (1,4) with (2,3)
+  ax3 <- concordance_component(X, i, l, j, k)
+  ay3 <- concordance_component(Y, i, l, j, k)
+
+  h1 <- ax1 * ay1
+  h2 <- ax2 * ay2
+  h3 <- ax3 * ay3
+
+  (h1 + h2 + h3) / 3
+}
+
+
+## 5. GENERATE RANDOM DISTINCT QUADRUPLES ------------------------------------
+
+sample_quadruples <- function(n, B) {
+
+  out <- matrix(NA_integer_, nrow = B, ncol = 4)
+
+  for (r in seq_len(B)) {
+    out[r, ] <- sort(sample.int(n, size = 4, replace = FALSE))
+  }
+
+  out
+}
+
+
+## 6. FOURTH-ORDER U-STATISTIC -----------------------------------------------
+
+tau_star_mv <- function(X, Y,
+                        n_quads = 100000,
+                        exact_limit = 2000000) {
+
+  X <- as.matrix(X)
+  Y <- as.matrix(Y)
+
   n <- nrow(X)
 
-  if (length(Y) != n) stop("nrow(X) must equal length(Y).")
-  if (n < 4L) stop("At least four observations are required.")
-
-  q <- min(as.integer(n_quads), choose(n, 4))
-  if (q <= 0) stop("n_quads must be positive.")
-
-  # If all combinations are small enough, enumerate them exactly.
-  # Otherwise sample quadruples without replacement where feasible.
-  total_quad <- choose(n, 4)
-  if (total_quad <= q && total_quad < 2e6) {
-    cmb <- utils::combn(n, 4)
-    i <- cmb[1, ]; j <- cmb[2, ]; k <- cmb[3, ]; ell <- cmb[4, ]
-  } else {
-    # Generate distinct indices within each row, then sort each quadruple.
-    # Duplicate quadruples across rows are allowed; this is Monte Carlo
-    # sampling from the set of all quadruples.
-    ind <- matrix(NA_integer_, nrow = q, ncol = 4)
-    for (r in seq_len(q)) ind[r, ] <- sort(sample.int(n, 4L, replace = FALSE))
-    i <- ind[, 1]; j <- ind[, 2]; k <- ind[, 3]; ell <- ind[, 4]
+  if (nrow(Y) != n) {
+    stop("X and Y must have the same number of observations.")
   }
 
-  # Kernel as coded in the manuscript's custom Parkinson example:
-  # sign_product(X_i, X_j) * sign_product(X_k, X_ell)
-  # multiplied by sign(Y_i-Y_j) * sign(Y_k-Y_ell).
-  sx1 <- sign_product_rows(X, i, j)
-  sx2 <- sign_product_rows(X, k, ell)
-  sy1 <- sign(Y[i] - Y[j])
-  sy2 <- sign(Y[k] - Y[ell])
+  if (n < 4) {
+    stop("At least four observations are required.")
+  }
 
-  mean(sx1 * sx2 * sy1 * sy2)
+  if (n_quads < 1) {
+    stop("n_quads must be positive.")
+  }
+
+  total <- choose(n, 4)
+
+  if (total <= exact_limit) {
+
+    # Exact U-statistic.
+    ind <- utils::combn(n, 4)
+    ind <- t(ind)
+
+    values <- kernel_tau4(X, Y, ind)
+
+    return(mean(values))
+
+  } else {
+
+    # Monte Carlo approximation to the complete U-statistic.
+    B <- min(as.integer(n_quads), as.integer(total))
+
+    ind <- sample_quadruples(n, B)
+
+    values <- kernel_tau4(X, Y, ind)
+
+    return(mean(values))
+  }
 }
 
-## ------------------------- SUBSAMPLING HELPERS ------------------------------
+
+## 7. SUBSAMPLE SIZE ----------------------------------------------------------
 
 get_subsample_size <- function(n, gamma = 0.70) {
+
   b <- floor(n^gamma)
+
   b <- max(4L, min(as.integer(b), n - 1L))
+
   b
 }
 
-subsampling_distribution <- function(X, Y, tau_full, b, M = 100,
-                                     n_quads = 10000) {
+
+## 8. SUBSAMPLING DISTRIBUTION ------------------------------------------------
+
+# Section 5.1:
+#
+# T_m = sqrt(b_n) * (tau_hat_b(m) - tau_hat_n).
+#
+# The subsample estimates are calculated exactly whenever feasible.
+
+subsampling_distribution <- function(X, Y, tau_full,
+                                     b,
+                                     M = 300,
+                                     n_quads = 100000,
+                                     exact_limit = 2000000) {
+
   n <- nrow(X)
-  if (b >= n) stop("Subsample size b must be smaller than n.")
+
+  if (b >= n) {
+    stop("Subsample size must be smaller than the original sample size.")
+  }
 
   vals <- numeric(M)
+
   for (m in seq_len(M)) {
+
     idx <- sample.int(n, size = b, replace = FALSE)
-    tau_b <- tau_star_mv_mc(X[idx, , drop = FALSE], Y[idx],
-                            n_quads = n_quads)
+
+    tau_b <- tau_star_mv(
+      X[idx, , drop = FALSE],
+      Y[idx, , drop = FALSE],
+      n_quads = n_quads,
+      exact_limit = exact_limit
+    )
+
     vals[m] <- sqrt(b) * (tau_b - tau_full)
   }
+
   vals
 }
 
-# Basic two-sided subsampling CI obtained by quantile inversion:
-# [tau_hat - q_(1-alpha/2)/sqrt(n), tau_hat - q_(alpha/2)/sqrt(n)].
-# Use only if the relevant root-n limit is justified for the statistic.
-subsampling_ci <- function(tau_hat, sub_dist, n, alpha = 0.05) {
-  qq <- quantile(sub_dist,
-                 probs = c(alpha / 2, 1 - alpha / 2),
-                 names = FALSE, type = 8)
+
+## 9. SUBSAMPLING CONFIDENCE INTERVAL ----------------------------------------
+
+# The confidence interval follows the quantile inversion in Section 5.1:
+#
+# [tau_hat - q_(1-alpha/2)/sqrt(n),
+#  tau_hat - q_(alpha/2)/sqrt(n)].
+
+subsampling_ci <- function(tau_hat, sub_dist,
+                           n, alpha = 0.05) {
+
+  qq <- quantile(
+    sub_dist,
+    probs = c(alpha / 2, 1 - alpha / 2),
+    names = FALSE,
+    type = 8
+  )
+
   lower <- tau_hat - qq[2] / sqrt(n)
   upper <- tau_hat - qq[1] / sqrt(n)
+
   c(lower = lower, upper = upper)
 }
 
-## --------------------- POPULATION-REFERENCE APPROXIMATION ------------------
 
-# For alternatives, estimate the population target of the custom kernel using
-# an independent, large sample and many sampled quadruples. Under independence,
-# the target is set to zero for the stated construction.
-estimate_reference_tau <- function(scenario, p, n_ref, n_quads_ref,
-                                   noise_sd, rho, sine_frequency,
-                                   seed = 1234) {
-  if (scenario == "independence") return(0)
+## 10. UPPER-TAIL SUBSAMPLING TEST -------------------------------------------
 
-  set.seed(seed)
-  ref <- generate_data(n_ref, p, scenario, noise_sd, rho, sine_frequency)
-  tau_star_mv_mc(ref$X, ref$Y, n_quads = n_quads_ref)
+# Section 5.1 proposes rejecting H0 when
+#
+# sqrt(n) * tau_hat > q_(1-alpha),
+#
+# where q_(1-alpha) is the upper quantile of the centred subsampling
+# distribution.
+
+subsampling_test <- function(tau_hat, sub_dist,
+                             n, alpha = 0.05) {
+
+  observed <- sqrt(n) * tau_hat
+
+  critical_value <- as.numeric(
+    quantile(sub_dist, 1 - alpha, names = FALSE, type = 8)
+  )
+
+  p_value <- (1 + sum(sub_dist >= observed)) /
+    (length(sub_dist) + 1)
+
+  list(
+    statistic = observed,
+    critical_value = critical_value,
+    p_value = p_value,
+    reject = as.integer(observed > critical_value)
+  )
 }
 
-## ------------------------- ONE DATASET REPLICATION --------------------------
 
-run_one_replication <- function(n, scenario, p, M, n_quads, gamma, alpha,
-                                tau_reference, noise_sd, rho,
-                                sine_frequency) {
-  dat <- generate_data(n, p, scenario, noise_sd, rho, sine_frequency)
-  tau_hat <- tau_star_mv_mc(dat$X, dat$Y, n_quads = n_quads)
+## 11. REFERENCE VALUE --------------------------------------------------------
+
+# Under independence, the population target is zero according to the
+# manuscript's population formulation.
+#
+# Under alternatives, use an independent large-sample Monte Carlo estimate.
+# This is a numerical reference, not an analytic population value.
+
+estimate_reference_tau <- function(
+    scenario,
+    p,
+    q,
+    n_ref,
+    n_quads_ref,
+    noise_sd,
+    rho,
+    sine_frequency,
+    seed = 1234) {
+
+  if (scenario == "independence") {
+    return(0)
+  }
+
+  set.seed(seed)
+
+  ref <- generate_data(
+    n = n_ref,
+    p = p,
+    q = q,
+    scenario = scenario,
+    noise_sd = noise_sd,
+    rho = rho,
+    sine_frequency = sine_frequency
+  )
+
+  tau_star_mv(
+    ref$X,
+    ref$Y,
+    n_quads = n_quads_ref,
+    exact_limit = 0
+  )
+}
+
+
+## 12. ONE MONTE CARLO REPLICATION -------------------------------------------
+
+run_one_replication <- function(
+    n,
+    scenario,
+    p,
+    q,
+    M,
+    n_quads,
+    gamma,
+    alpha,
+    tau_reference,
+    noise_sd,
+    rho,
+    sine_frequency,
+    exact_limit) {
+
+  dat <- generate_data(
+    n = n,
+    p = p,
+    q = q,
+    scenario = scenario,
+    noise_sd = noise_sd,
+    rho = rho,
+    sine_frequency = sine_frequency
+  )
+
+  tau_hat <- tau_star_mv(
+    dat$X,
+    dat$Y,
+    n_quads = n_quads,
+    exact_limit = exact_limit
+  )
+
   b <- get_subsample_size(n, gamma)
 
   sub_dist <- subsampling_distribution(
-    X = dat$X, Y = dat$Y, tau_full = tau_hat, b = b,
-    M = M, n_quads = n_quads
+    X = dat$X,
+    Y = dat$Y,
+    tau_full = tau_hat,
+    b = b,
+    M = M,
+    n_quads = n_quads,
+    exact_limit = exact_limit
   )
 
-  ci <- subsampling_ci(tau_hat, sub_dist, n, alpha)
-  reject_zero <- (ci["lower"] > 0 || ci["upper"] < 0)
-  covered <- (ci["lower"] <= tau_reference &&
-              tau_reference <= ci["upper"])
+  ci <- subsampling_ci(
+    tau_hat = tau_hat,
+    sub_dist = sub_dist,
+    n = n,
+    alpha = alpha
+  )
+
+  test <- subsampling_test(
+    tau_hat = tau_hat,
+    sub_dist = sub_dist,
+    n = n,
+    alpha = alpha
+  )
+
+  # Interval-based rejection, as used in the original simulation section.
+  reject_interval <- as.integer(
+    ci["lower"] > 0 || ci["upper"] < 0
+  )
+
+  covered <- as.integer(
+    ci["lower"] <= tau_reference &&
+      tau_reference <= ci["upper"]
+  )
 
   data.frame(
     scenario = scenario,
     n = n,
     p = p,
+    q = q,
     b = b,
+
     tau_hat = tau_hat,
     tau_reference = tau_reference,
+
     ci_lower = unname(ci["lower"]),
     ci_upper = unname(ci["upper"]),
     ci_width = unname(ci["upper"] - ci["lower"]),
-    covers_reference = as.integer(covered),
-    reject_zero = as.integer(reject_zero),
-    sub_q025 = unname(quantile(sub_dist, alpha / 2, names = FALSE)),
-    sub_median = unname(quantile(sub_dist, 0.50, names = FALSE)),
-    sub_q975 = unname(quantile(sub_dist, 1 - alpha / 2, names = FALSE))
+
+    covers_reference = covered,
+
+    # Keep the two decision rules separate.
+    reject_interval = reject_interval,
+    reject_upper_tail = test$reject,
+
+    upper_tail_statistic = test$statistic,
+    upper_tail_critical = test$critical_value,
+    upper_tail_pvalue = test$p_value,
+
+    sub_q025 = unname(
+      quantile(sub_dist, alpha / 2, names = FALSE)
+    ),
+
+    sub_median = unname(
+      quantile(sub_dist, 0.50, names = FALSE)
+    ),
+
+    sub_q975 = unname(
+      quantile(sub_dist, 1 - alpha / 2, names = FALSE)
+    )
   )
 }
 
-## ------------------------------ RUN STUDY -----------------------------------
+
+## 13. RUN THE SIMULATION -----------------------------------------------------
 
 all_results <- list()
-result_counter <- 1L
+counter <- 1L
 
 for (scenario in SCENARIOS) {
+
   message("\nScenario: ", scenario)
 
   tau_ref <- estimate_reference_tau(
     scenario = scenario,
     p = P,
+    q = Q,
     n_ref = N_REF,
     n_quads_ref = N_QUADS_REF,
     noise_sd = NOISE_SD,
@@ -247,39 +506,51 @@ for (scenario in SCENARIOS) {
     seed = 7000 + match(scenario, SCENARIOS)
   )
 
-  message("Reference value for custom kernel: ",
-          format(tau_ref, digits = 5))
+  message(
+    "Reference value = ",
+    format(tau_ref, digits = 6)
+  )
 
   for (n in N_VALUES) {
-    message("  n = ", n, "; b = ", get_subsample_size(n, SUBSAMPLE_POWER))
+
+    b <- get_subsample_size(n, SUBSAMPLE_POWER)
+
+    message("  n = ", n, "; b = ", b)
 
     rep_results <- vector("list", R_MC)
 
     for (r in seq_len(R_MC)) {
-      # Reproducible but different random stream for each replication.
-      set.seed(100000 + 1000 * match(scenario, SCENARIOS) + 10 * n + r)
+
+      set.seed(
+        100000 +
+          10000 * match(scenario, SCENARIOS) +
+          100 * n + r
+      )
 
       rep_results[[r]] <- run_one_replication(
         n = n,
         scenario = scenario,
         p = P,
+        q = Q,
         M = M_SUBSAMPLES,
-        n_quads = N_QUADS,
+        n_quads = N_QUADS_FULL,
         gamma = SUBSAMPLE_POWER,
         alpha = ALPHA,
         tau_reference = tau_ref,
         noise_sd = NOISE_SD,
         rho = LINEAR_RHO,
-        sine_frequency = SINE_FREQUENCY
+        sine_frequency = SINE_FREQUENCY,
+        exact_limit = EXACT_LIMIT
       )
 
       if (r %% 10 == 0) {
-        message("    completed replication ", r, " / ", R_MC)
+        message("    Replication ", r, " / ", R_MC)
       }
     }
 
-    all_results[[result_counter]] <- do.call(rbind, rep_results)
-    result_counter <- result_counter + 1L
+    all_results[[counter]] <- do.call(rbind, rep_results)
+
+    counter <- counter + 1L
   }
 }
 
@@ -288,130 +559,270 @@ row.names(replication_results) <- NULL
 
 write.csv(
   replication_results,
-  file = file.path(OUTPUT_DIR, "subsampling_replication_results.csv"),
+  file = file.path(
+    OUTPUT_DIR,
+    "subsampling_replication_results.csv"
+  ),
   row.names = FALSE
 )
 
-## ---------------------------- SUMMARY TABLES -------------------------------
 
-# The reported "rejection probability" is the fraction of intervals excluding
-# zero. Under the independence null, this estimates empirical size. Under
-# alternatives it is an interval-based rejection rate/power proxy.
+## 14. SUMMARY TABLE ----------------------------------------------------------
+
 summarise_group <- function(d) {
+
+  rejection_interval <- mean(d$reject_interval)
+  rejection_upper <- mean(d$reject_upper_tail)
+
   data.frame(
     scenario = d$scenario[1],
     n = d$n[1],
     p = d$p[1],
+    q = d$q[1],
     b = d$b[1],
-    mean_tau_hat = mean(d$tau_hat, na.rm = TRUE),
-    sd_tau_hat = sd(d$tau_hat, na.rm = TRUE),
-    empirical_rejection = mean(d$reject_zero, na.rm = TRUE),
-    rejection_mcse = sqrt(
-      mean(d$reject_zero, na.rm = TRUE) *
-        (1 - mean(d$reject_zero, na.rm = TRUE)) / nrow(d)
+
+    mean_tau_hat = mean(d$tau_hat),
+    sd_tau_hat = sd(d$tau_hat),
+
+    interval_rejection = rejection_interval,
+
+    interval_rejection_mcse = sqrt(
+      rejection_interval * (1 - rejection_interval) / nrow(d)
     ),
-    empirical_coverage = mean(d$covers_reference, na.rm = TRUE),
-    mean_ci_width = mean(d$ci_width, na.rm = TRUE),
-    sd_ci_width = sd(d$ci_width, na.rm = TRUE),
+
+    upper_tail_rejection = rejection_upper,
+
+    upper_tail_rejection_mcse = sqrt(
+      rejection_upper * (1 - rejection_upper) / nrow(d)
+    ),
+
+    empirical_coverage = mean(d$covers_reference),
+
+    coverage_mcse = sqrt(
+      mean(d$covers_reference) *
+        (1 - mean(d$covers_reference)) / nrow(d)
+    ),
+
+    mean_ci_width = mean(d$ci_width),
+    sd_ci_width = sd(d$ci_width),
+
+    mean_upper_tail_pvalue = mean(d$upper_tail_pvalue),
+
     reference_tau = d$tau_reference[1]
   )
 }
 
 summary_list <- split(
   replication_results,
-  interaction(replication_results$scenario,
-              replication_results$n, drop = TRUE)
+  interaction(
+    replication_results$scenario,
+    replication_results$n,
+    drop = TRUE
+  )
 )
-summary_results <- do.call(rbind, lapply(summary_list, summarise_group))
+
+summary_results <- do.call(
+  rbind,
+  lapply(summary_list, summarise_group)
+)
+
 row.names(summary_results) <- NULL
 
 write.csv(
   summary_results,
-  file = file.path(OUTPUT_DIR, "subsampling_summary_results.csv"),
+  file = file.path(
+    OUTPUT_DIR,
+    "subsampling_summary_results.csv"
+  ),
   row.names = FALSE
 )
 
-cat("\n================ SUBSAMPLING SUMMARY ================\n")
+cat("\n================ SUMMARY RESULTS ================\n")
 print(summary_results, digits = 4, row.names = FALSE)
 
-## ------------------------------ DIAGNOSTIC PLOTS ---------------------------
 
-# 1. Empirical rejection rate by sample size and scenario.
-png(file.path(OUTPUT_DIR, "empirical_rejection.png"),
-    width = 1200, height = 800, res = 140)
+## 15. DIAGNOSTIC PLOTS -------------------------------------------------------
+
 scens <- unique(summary_results$scenario)
-plot(NA, xlim = range(N_VALUES), ylim = c(0, 1),
-     xlab = "Sample size n", ylab = "Empirical rejection probability",
-     main = "Subsampling interval test: empirical rejection")
+
+# Plot 1: Interval-based rejection rates.
+
+png(
+  file.path(OUTPUT_DIR, "interval_rejection_rates.png"),
+  width = 1200, height = 800, res = 140
+)
+
+plot(
+  NA,
+  xlim = range(N_VALUES),
+  ylim = c(0, 1),
+  xlab = "Sample size n",
+  ylab = "Interval-based rejection probability",
+  main = "Subsampling confidence-interval rejection rates"
+)
+
 for (s in scens) {
   ds <- summary_results[summary_results$scenario == s, ]
-  lines(ds$n, ds$empirical_rejection, type = "b", pch = 19)
+  lines(ds$n, ds$interval_rejection, type = "b", pch = 19)
 }
+
 abline(h = ALPHA, lty = 2)
-legend("topleft", legend = c(scens, paste0("Nominal alpha = ", ALPHA)),
-       lty = c(rep(1, length(scens)), 2),
-       pch = c(rep(19, length(scens)), NA), bty = "n")
+
+legend(
+  "topleft",
+  legend = c(scens, paste0("Nominal level = ", ALPHA)),
+  lty = c(rep(1, length(scens)), 2),
+  pch = c(rep(19, length(scens)), NA),
+  bty = "n"
+)
+
 dev.off()
 
-# 2. Empirical coverage by sample size and scenario.
-png(file.path(OUTPUT_DIR, "empirical_coverage.png"),
-    width = 1200, height = 800, res = 140)
-plot(NA, xlim = range(N_VALUES), ylim = c(0, 1),
-     xlab = "Sample size n", ylab = "Empirical coverage probability",
-     main = "Subsampling confidence interval coverage")
+
+# Plot 2: Upper-tail test rejection rates.
+
+png(
+  file.path(OUTPUT_DIR, "upper_tail_rejection_rates.png"),
+  width = 1200, height = 800, res = 140
+)
+
+plot(
+  NA,
+  xlim = range(N_VALUES),
+  ylim = c(0, 1),
+  xlab = "Sample size n",
+  ylab = "Upper-tail rejection probability",
+  main = "Upper-tail subsampling test"
+)
+
+for (s in scens) {
+  ds <- summary_results[summary_results$scenario == s, ]
+  lines(ds$n, ds$upper_tail_rejection, type = "b", pch = 19)
+}
+
+abline(h = ALPHA, lty = 2)
+
+legend(
+  "topleft",
+  legend = c(scens, paste0("Nominal level = ", ALPHA)),
+  lty = c(rep(1, length(scens)), 2),
+  pch = c(rep(19, length(scens)), NA),
+  bty = "n"
+)
+
+dev.off()
+
+
+# Plot 3: Coverage probabilities.
+
+png(
+  file.path(OUTPUT_DIR, "empirical_coverage.png"),
+  width = 1200, height = 800, res = 140
+)
+
+plot(
+  NA,
+  xlim = range(N_VALUES),
+  ylim = c(0, 1),
+  xlab = "Sample size n",
+  ylab = "Empirical coverage probability",
+  main = "Subsampling confidence-interval coverage"
+)
+
 for (s in scens) {
   ds <- summary_results[summary_results$scenario == s, ]
   lines(ds$n, ds$empirical_coverage, type = "b", pch = 19)
 }
+
 abline(h = 1 - ALPHA, lty = 2)
-legend("bottomright", legend = c(scens, paste0("Nominal coverage = ", 1 - ALPHA)),
-       lty = c(rep(1, length(scens)), 2),
-       pch = c(rep(19, length(scens)), NA), bty = "n")
+
+legend(
+  "bottomright",
+  legend = c(scens, paste0("Nominal coverage = ", 1 - ALPHA)),
+  lty = c(rep(1, length(scens)), 2),
+  pch = c(rep(19, length(scens)), NA),
+  bty = "n"
+)
+
 dev.off()
 
-# 3. Average interval width by sample size and scenario.
-png(file.path(OUTPUT_DIR, "mean_interval_width.png"),
-    width = 1200, height = 800, res = 140)
-plot(NA, xlim = range(N_VALUES),
-     ylim = range(summary_results$mean_ci_width, finite = TRUE),
-     xlab = "Sample size n", ylab = "Mean interval width",
-     main = "Average width of subsampling confidence intervals")
+
+# Plot 4: Mean interval width.
+
+png(
+  file.path(OUTPUT_DIR, "mean_interval_width.png"),
+  width = 1200, height = 800, res = 140
+)
+
+plot(
+  NA,
+  xlim = range(N_VALUES),
+  ylim = range(summary_results$mean_ci_width, finite = TRUE),
+  xlab = "Sample size n",
+  ylab = "Mean interval width",
+  main = "Average subsampling confidence-interval width"
+)
+
 for (s in scens) {
   ds <- summary_results[summary_results$scenario == s, ]
   lines(ds$n, ds$mean_ci_width, type = "b", pch = 19)
 }
-legend("topright", legend = scens, lty = 1, pch = 19, bty = "n")
+
+legend(
+  "topright",
+  legend = scens,
+  lty = 1,
+  pch = 19,
+  bty = "n"
+)
+
 dev.off()
 
-# 4. Distribution of full-sample estimates by scenario and n.
-png(file.path(OUTPUT_DIR, "tau_estimate_boxplots.png"),
-    width = 1400, height = 900, res = 140)
-boxplot(tau_hat ~ interaction(scenario, n),
-        data = replication_results, las = 2,
-        xlab = "Scenario and sample size",
-        ylab = expression(hat(tau)^"*"),
-        main = "Distribution of full-sample dependence estimates")
+
+# Plot 5: Distribution of estimates.
+
+png(
+  file.path(OUTPUT_DIR, "tau_estimate_boxplots.png"),
+  width = 1400, height = 900, res = 140
+)
+
+boxplot(
+  tau_hat ~ interaction(scenario, n),
+  data = replication_results,
+  las = 2,
+  xlab = "Scenario and sample size",
+  ylab = expression(hat(tau)^"*"),
+  main = "Distribution of full-sample estimates"
+)
+
 dev.off()
 
-cat("\nFiles written to: ", normalizePath(OUTPUT_DIR), "\n", sep = "")
-cat(" - subsampling_replication_results.csv\n")
-cat(" - subsampling_summary_results.csv\n")
-cat(" - empirical_rejection.png\n")
-cat(" - empirical_coverage.png\n")
-cat(" - mean_interval_width.png\n")
-cat(" - tau_estimate_boxplots.png\n")
+
+## 16. SAVE SETTINGS AND COMPLETION MESSAGE ----------------------------------
+
+settings <- data.frame(
+  parameter = c(
+    "N_VALUES", "P", "Q", "R_MC", "M_SUBSAMPLES",
+    "N_QUADS_FULL", "N_QUADS_REF", "N_REF",
+    "ALPHA", "SUBSAMPLE_POWER", "EXACT_LIMIT"
+  ),
+  value = c(
+    paste(N_VALUES, collapse = ","),
+    P, Q, R_MC, M_SUBSAMPLES,
+    N_QUADS_FULL, N_QUADS_REF, N_REF,
+    ALPHA, SUBSAMPLE_POWER, EXACT_LIMIT
+  )
+)
+
+write.csv(
+  settings,
+  file = file.path(OUTPUT_DIR, "simulation_settings.csv"),
+  row.names = FALSE
+)
+
+cat("\nSimulation completed.\n")
+cat("Results directory: ", normalizePath(OUTPUT_DIR), "\n", sep = "")
 
 ###############################################################################
-# OPTIONAL SENSITIVITY ANALYSIS
-#
-# Repeat the study with:
-#   SUBSAMPLE_POWER <- 0.60 and 0.80
-#   N_QUADS <- 5000, 10000, 25000
-#   M_SUBSAMPLES <- 200 or 500
-#   R_MC <- 500 or more
-#
-# Do not compare results across settings unless the random-quadruple
-# approximation error has been checked. For final publication, validate the
-# kernel mathematically and compare the Monte Carlo approximation with exact
-# enumeration for small n (e.g., n <= 30).
+# END OF PROGRAM
 ###############################################################################
